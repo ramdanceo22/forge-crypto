@@ -129,9 +129,9 @@ export function labelObject(repo: Repo, label: Label): Record<string, unknown> {
 /** The public comment object. */
 function commentObject(store: Store, repo: Repo, issue: Issue, comment: Issue['comments'][number]): Record<string, unknown> {
   return {
-    id: comment.id,
+    id: comment.num,
     node_id: comment.id,
-    url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/comments/${encodeURIComponent(comment.id)}`,
+    url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/comments/${comment.num}`,
     html_url: '',
     body: comment.body,
     user: userObject(store),
@@ -676,9 +676,14 @@ export function handleRest(ctx: RestContext): boolean {
       if (tail.length === 1) {
         if (method === 'GET') {
           const state = query.get('state') ?? 'open';
+          const sortKey = query.get('sort') === 'updated' ? 'updatedAt' : 'createdAt';
+          const dir = query.get('direction') === 'asc' ? 1 : -1;
           const list = [...repo.issues.values()]
             .filter((issue) => state === 'all' || issue.state === state)
-            .sort((a, b) => (a.createdAt === b.createdAt ? b.number - a.number : a.createdAt < b.createdAt ? 1 : -1));
+            .sort((a, b) => {
+              if (a[sortKey] === b[sortKey]) return dir * (a.number - b.number);
+              return dir * (a[sortKey] < b[sortKey] ? -1 : 1);
+            });
           const { page, link } = paginate(list, query, req, ctx.path);
           sendJson(res, 200, page.map((issue) => issueObject(store, repo, issue)), link === null ? {} : { link });
           return true;
@@ -759,6 +764,7 @@ export function handleRest(ctx: RestContext): boolean {
           const now = nowIso();
           const comment: Issue['comments'][number] = {
             id: globalId('IC', `${repo.owner}/${repo.name}:${issue.number}:${issue.comments.length + 1}`),
+            num: issue.comments.length + 1,
             body: text,
             user: store.viewerLogin,
             createdAt: now,
@@ -891,8 +897,57 @@ export function handleRest(ctx: RestContext): boolean {
       return false;
     }
 
-    // Git refs (read-only convenience surface).
+    // Git refs: create (POST) and read (GET).
     if (tail[0] === 'git' && tail[1] === 'refs') {
+      if (method === 'POST' && tail.length === 2) {
+        if (!isRecord(body)) {
+          sendJson(res, 400, { message: 'Problems parsing JSON' });
+          return true;
+        }
+        const ref = stringField(body, 'ref');
+        const sha = stringField(body, 'sha');
+        if (!/^refs\/(heads|tags)\/.+/.test(ref) || !/^[0-9a-f]{40}$/.test(sha)) {
+          unprocessable(ctx, 'ref and sha are required');
+          return true;
+        }
+        const obj = repo.objects.get(sha);
+        if (obj === undefined) {
+          unprocessable(ctx, 'sha does not exist');
+          return true;
+        }
+        if (ref.startsWith('refs/heads/')) {
+          if (obj.type !== 'commit') {
+            unprocessable(ctx, 'sha is not a commit');
+            return true;
+          }
+          const name = ref.slice('refs/heads/'.length);
+          if (repo.branches.has(name)) {
+            unprocessable(ctx, 'Reference already exists');
+            return true;
+          }
+          repo.branches.set(name, { name, head: sha, files: filesAtCommit(repo, sha) });
+          sendJson(res, 201, {
+            ref,
+            node_id: globalId('REF', `${repo.owner}/${repo.name}:${ref}`),
+            url: '',
+            object: { sha, type: 'commit', url: '' },
+          });
+          return true;
+        }
+        const name = ref.slice('refs/tags/'.length);
+        if (repo.tags.has(name)) {
+          unprocessable(ctx, 'Reference already exists');
+          return true;
+        }
+        repo.tags.set(name, sha);
+        sendJson(res, 201, {
+          ref,
+          node_id: globalId('REF', `${repo.owner}/${repo.name}:${ref}`),
+          url: '',
+          object: { sha, type: obj.type, url: '' },
+        });
+        return true;
+      }
       if (method !== 'GET') return false;
       if (tail.length === 2) {
         const refs: Record<string, unknown>[] = [];
@@ -906,10 +961,32 @@ export function handleRest(ctx: RestContext): boolean {
             });
           }
         }
+        for (const [name, oid] of [...repo.tags.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+          refs.push({
+            ref: `refs/tags/${name}`,
+            node_id: globalId('REF', `${repo.owner}/${repo.name}:refs/tags/${name}`),
+            url: '',
+            object: { sha: oid, type: repo.objects.get(oid)?.type ?? 'commit', url: '' },
+          });
+        }
         sendJson(res, 200, refs);
         return true;
       }
       const refName = tail.slice(2).join('/');
+      if (refName.startsWith('tags/')) {
+        const oid = repo.tags.get(refName.slice('tags/'.length));
+        if (oid === undefined) {
+          notFound(ctx, 'Reference not found');
+          return true;
+        }
+        sendJson(res, 200, {
+          ref: `refs/${refName}`,
+          node_id: globalId('REF', `${repo.owner}/${repo.name}:refs/${refName}`),
+          url: '',
+          object: { sha: oid, type: repo.objects.get(oid)?.type ?? 'commit', url: '' },
+        });
+        return true;
+      }
       const branch = repo.branches.get(refName.replace(/^heads\//, ''));
       if (branch === undefined || branch.head === null) {
         notFound(ctx, 'Reference not found');

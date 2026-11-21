@@ -812,6 +812,7 @@ function resolveMutation(parent: Resolved, field: FieldNode, ctx: ExecContext): 
     }
     const comment = {
       id: globalId('IC', `${found.repo.owner}/${found.repo.name}:${found.issue.number}:${found.issue.comments.length + 1}`),
+      num: found.issue.comments.length + 1,
       body,
       user: store.viewerLogin,
       createdAt: found.issue.createdAt,

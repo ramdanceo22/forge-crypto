@@ -41,6 +41,7 @@ export interface Label {
 /** One issue comment. */
 export interface IssueComment {
   id: string;
+  num: number;
   body: string;
   user: string;
   createdAt: string;
@@ -101,6 +102,8 @@ export interface Repo {
   labelSeq: number;
   pulls: Map<number, PullRequest>;
   pullSeq: number;
+  /** Tag refs: tag name -> oid of the tag object (or the commit for a lightweight tag). */
+  tags: Map<string, string>;
 }
 
 /** A parsed commit object. */
@@ -370,6 +373,7 @@ export class Store {
       labelSeq: 0,
       pulls: new Map(),
       pullSeq: 0,
+      tags: new Map(),
     };
     this.nextRepoId += 1;
     this.repos.set(this.key(repo.owner, repo.name), repo);
@@ -542,6 +546,15 @@ export class Store {
   blobSha(content: Buffer): string {
     return putObjectShaless(content);
   }
+}
+
+/** The target oid a tag object points at (`object <sha>`), or null when the object is not a tag. */
+export function tagTarget(repo: Repo, tagOid: string): string | null {
+  const obj = repo.objects.get(tagOid);
+  if (obj === undefined || obj.type !== 'tag') return null;
+  const text = obj.data.toString('utf8');
+  const match = /^object ([0-9a-f]{40})$/m.exec(text);
+  return match === null ? null : match[1];
 }
 
 /** The git blob id of content, without storing it. */

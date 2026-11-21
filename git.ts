@@ -10,6 +10,7 @@ import {
   parseCommit,
   parseTree,
   putObject,
+  tagTarget,
   type FileEntry,
   type GitObject,
   type Repo,
@@ -307,7 +308,15 @@ export function collectObjects(
     if (seenCommits.has(sha) || haveReachable.has(sha)) continue;
     seenCommits.add(sha);
     const obj = repo.objects.get(sha);
-    if (obj === undefined || obj.type !== 'commit') continue;
+    if (obj === undefined) continue;
+    if (obj.type === 'tag') {
+      // A wanted tag: ship the tag object and walk its target commit.
+      if (!out.has(sha)) out.set(sha, obj);
+      const target = tagTarget(repo, sha);
+      if (target !== null) queue.push({ sha: target, depth });
+      continue;
+    }
+    if (obj.type !== 'commit') continue;
     out.set(sha, obj);
     const parsed = parseCommit(obj.data);
     addTree(parsed.tree);
@@ -320,7 +329,7 @@ export function collectObjects(
 
 // ---------------------------------------------------------------- advertisements
 
-/** The ref lines for a repository: HEAD first, then every branch. */
+/** The ref lines for a repository: HEAD first, then every branch, then every tag (with peeled lines for annotated tags). */
 function refLines(repo: Repo): { sha: string; name: string }[] {
   const lines: { sha: string; name: string }[] = [];
   const defaultBranch = repo.branches.get(repo.defaultBranch);
@@ -329,6 +338,11 @@ function refLines(repo: Repo): { sha: string; name: string }[] {
   }
   for (const branch of [...repo.branches.values()].sort((a, b) => (a.name < b.name ? -1 : 1))) {
     if (branch.head !== null) lines.push({ sha: branch.head, name: `refs/heads/${branch.name}` });
+  }
+  for (const [name, oid] of [...repo.tags.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    lines.push({ sha: oid, name: `refs/tags/${name}` });
+    const peeled = tagTarget(repo, oid);
+    if (peeled !== null) lines.push({ sha: peeled, name: `refs/tags/${name}^{}` });
   }
   return lines;
 }
@@ -384,6 +398,8 @@ export interface UploadRequest {
   deepen?: number;
   refPrefixes: string[];
   command?: string;
+  peel?: boolean;
+  symrefs?: boolean;
 }
 
 /** Parse a v0 upload-pack request body. */
@@ -411,6 +427,8 @@ export function parseUploadV2(body: Buffer): UploadRequest {
     else if (line.startsWith('have ')) req.haves.push(line.slice(5).trim());
     else if (line.startsWith('deepen ')) req.deepen = Number.parseInt(line.slice(7).trim(), 10);
     else if (line.startsWith('ref-prefix ')) req.refPrefixes.push(line.slice('ref-prefix '.length).trim());
+    else if (line === 'peel') req.peel = true;
+    else if (line === 'symrefs') req.symrefs = true;
   }
   return req;
 }
@@ -433,16 +451,26 @@ export function answerLsRefs(repo: Repo, req: UploadRequest): Buffer {
     const name = `refs/heads/${branch.name}`;
     if (branch.head !== null && matches(name)) lines.push(`${branch.head} ${name}\n`);
   }
+  for (const [name, oid] of [...repo.tags.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    const refName = `refs/tags/${name}`;
+    if (matches(refName)) lines.push(`${oid} ${refName}\n`);
+    if (req.peel === true && matches(refName)) {
+      const peeled = tagTarget(repo, oid);
+      if (peeled !== null) lines.push(`${peeled} ${refName}^{}\n`);
+    }
+  }
   return pktLines(...lines);
 }
 
-/** Answer a v2 fetch request: shallow lines, then "packfile", then the packfile framed as side-band-64k (channel 1), then a flush. */
+/** Answer a v2 fetch request: the sections the v2 fetch response is made of — a shallow-info section (when deepening) closed by a flush, then the packfile section carrying the pack as side-band-64k (channel 1). */
 export function answerFetchV2(repo: Repo, req: UploadRequest): Buffer {
   const objects = collectObjects(repo, req.wants, new Set(req.haves), req.deepen);
   const pack = buildPack([...objects.values()].sort((a, b) => (objectShaOf(a) < objectShaOf(b) ? -1 : 1)));
   const chunks: Buffer[] = [];
   if (req.deepen !== undefined) {
+    chunks.push(pktLine('shallow-info\n'));
     for (const want of req.wants) chunks.push(pktLine(`shallow ${want}\n`));
+    chunks.push(PKT_FLUSH);
   }
   chunks.push(pktLine('packfile\n'));
   chunks.push(sidebandPack(pack));
@@ -484,7 +512,7 @@ export function parseReceive(body: Buffer): { updates: RefUpdate[]; pack: Buffer
     const [head, caps] = raw.split('\0');
     if (caps !== undefined && caps.includes('side-band-64k')) sideband = true;
     const line = (head as string).trim();
-    const match = /^([0-9a-f]{40}) ([0-9a-f]{40}) (refs\/heads\/[^\s]+)\s*$/.exec(line);
+    const match = /^([0-9a-f]{40}) ([0-9a-f]{40}) (refs\/(?:heads|tags)\/[^\s]+)\s*$/.exec(line);
     if (match !== null) {
       updates.push({ oldSha: match[1] as string, newSha: match[2] as string, ref: match[3] as string });
     }
@@ -507,6 +535,34 @@ export function applyReceivePack(repo: Repo, body: Buffer): { lines: string[]; s
   }
   const lines: string[] = ['unpack ok'];
   for (const update of updates) {
+    if (update.ref.startsWith('refs/tags/')) {
+      const tagName = update.ref.replace('refs/tags/', '');
+      const current = repo.tags.get(tagName) ?? null;
+      if (update.newSha === ZERO_OID) {
+        if (current === null) {
+          lines.push(`ng ${update.ref} no such ref`);
+        } else if (update.oldSha !== ZERO_OID && update.oldSha !== current) {
+          lines.push(`ng ${update.ref} old value does not match`);
+        } else {
+          repo.tags.delete(tagName);
+          lines.push(`ok ${update.ref}`);
+        }
+        continue;
+      }
+      if (update.oldSha !== ZERO_OID && update.oldSha !== current) {
+        lines.push(`ng ${update.ref} old value does not match`);
+        continue;
+      }
+      const newObj = repo.objects.get(update.newSha);
+      if (newObj === undefined || (newObj.type !== 'tag' && newObj.type !== 'commit')) {
+        lines.push(`ng ${update.ref} new object not in pack`);
+        continue;
+      }
+      repo.tags.set(tagName, update.newSha);
+      repo.updatedAt = nowIso();
+      lines.push(`ok ${update.ref}`);
+      continue;
+    }
     const branchName = update.ref.replace('refs/heads/', '');
     const branch = repo.branches.get(branchName);
     const current = branch?.head ?? null;
