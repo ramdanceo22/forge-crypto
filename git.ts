@@ -504,11 +504,24 @@ export function answerLsRefs(repo: Repo, req: UploadRequest): Buffer {
   return pktLines(...lines);
 }
 
-/** Answer a v2 fetch request: the sections the v2 fetch response is made of — a shallow-info section (when deepening) with the new boundary and the old boundaries it unshallows, closed by a flush, then the packfile section carrying the pack as side-band-64k (channel 1). */
+/** Answer a v2 fetch request: the sections the v2 fetch response is made of — an acknowledgments section when the client sent haves (ACK for the haves we hold, else NAK), a shallow-info section (when deepening) with the new boundary and the old boundaries it unshallows, closed by a flush, then the packfile section carrying the pack as side-band-64k (channel 1). */
 export function answerFetchV2(repo: Repo, req: UploadRequest): Buffer {
   const objects = collectObjects(repo, req.wants, new Set(req.haves), req.deepen, new Set(req.shallow));
   const pack = buildPack([...objects.values()].sort((a, b) => (objectShaOf(a) < objectShaOf(b) ? -1 : 1)));
   const chunks: Buffer[] = [];
+  if (req.haves.length > 0) {
+    chunks.push(pktLine('acknowledgments\n'));
+    let acked = false;
+    for (const have of req.haves) {
+      const obj = repo.objects.get(have);
+      if (obj !== undefined && obj.type === 'commit') {
+        chunks.push(pktLine(`ACK ${have}\n`));
+        acked = true;
+      }
+    }
+    if (!acked) chunks.push(pktLine('NAK\n'));
+    chunks.push(PKT_FLUSH);
+  }
   if (req.deepen !== undefined) {
     const boundary = shallowBoundary(repo, req.wants, req.deepen);
     chunks.push(pktLine('shallow-info\n'));

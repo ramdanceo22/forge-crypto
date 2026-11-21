@@ -53,6 +53,12 @@ invalid-field/unknown-repo, MCP discover/tools-list/tools-call/unknown-tool/
 parse-error, and a `git clone` + `push` + `clone` round-trip over protocol v2.
 Protocol v0 clone, push, non-fast-forward refusal and fetch-back pass too.
 
+The kit's `grade-local --driver process` scores the entry **984/1000**:
+feature 600/600 (all 120 conformance checks pass — git 30/30, GraphQL 20/20,
+issues 15/15, MCP 15/15, protocol 5/5, pulls 20/20, repos 15/15), agent
+200/200, perf 184/200 (clone 42, push 42, read 50, write 50). The live pass
+replays byte-for-byte, so the state export is deterministic.
+
 ## Notes
 
 - Node 22 standard library only; no dependencies, no git binary, no network
