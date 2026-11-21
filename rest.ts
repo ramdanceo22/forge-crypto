@@ -12,6 +12,7 @@ import {
   parseCommit,
   parseTree,
   putObject,
+  tagTarget,
   type Issue,
   type Label,
   type PullRequest,
@@ -513,7 +514,22 @@ export function handleRest(ctx: RestContext): boolean {
     // Commits.
     if (tail[0] === 'commits') {
       if (tail.length === 1 && method === 'GET') {
-        const head = repo.branches.get(repo.defaultBranch)?.head ?? null;
+        // ?sha=<branch|tag|commit> walks from that ref; without it, from the
+        // default branch. An unknown ref is a 404.
+        const shaParam = query.get('sha') ?? '';
+        let head: string | null;
+        if (shaParam !== '') {
+          const branch = repo.branches.get(shaParam);
+          if (branch !== undefined) head = branch.head;
+          else if (repo.tags.has(shaParam)) head = tagTarget(repo, repo.tags.get(shaParam) as string);
+          else if (repo.objects.get(shaParam)?.type === 'commit') head = shaParam;
+          else {
+            notFound(ctx, `No commit found for SHA: ${shaParam}`);
+            return true;
+          }
+        } else {
+          head = repo.branches.get(repo.defaultBranch)?.head ?? null;
+        }
         const list: Record<string, unknown>[] = [];
         if (head !== null) {
           const seen = new Set<string>();

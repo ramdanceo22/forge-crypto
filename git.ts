@@ -305,7 +305,7 @@ export function collectObjects(
   const seenCommits = new Set<string>();
   while (queue.length > 0) {
     const { sha, depth } = queue.pop() as { sha: string; depth: number };
-    if (seenCommits.has(sha) || haveReachable.has(sha)) continue;
+    if (seenCommits.has(sha)) continue;
     seenCommits.add(sha);
     const obj = repo.objects.get(sha);
     if (obj === undefined) continue;
@@ -317,14 +317,43 @@ export function collectObjects(
       continue;
     }
     if (obj.type !== 'commit') continue;
-    out.set(sha, obj);
+    // A commit the client already holds is not re-sent, but the walk goes
+    // through it: a deepen fetch wants the parents of a held tip.
     const parsed = parseCommit(obj.data);
-    addTree(parsed.tree);
+    if (!haveReachable.has(sha)) {
+      out.set(sha, obj);
+      addTree(parsed.tree);
+    }
     if (deepen === undefined || depth + 1 < deepen) {
       for (const parent of parsed.parents) queue.push({ sha: parent, depth: depth + 1 });
     }
   }
   return out;
+}
+
+/**
+ * The shallow boundary for a depth-limited walk: the commits at depth
+ * `deepen - 1` (0 = the wanted commits) that still have parents. Those are
+ * the commits a shallow clone records as its boundary.
+ */
+export function shallowBoundary(repo: Repo, wants: readonly string[], deepen: number): string[] {
+  const boundary: string[] = [];
+  const seen = new Set<string>();
+  const queue: { sha: string; depth: number }[] = wants.map((sha) => ({ sha, depth: 0 }));
+  while (queue.length > 0) {
+    const { sha, depth } = queue.pop() as { sha: string; depth: number };
+    if (seen.has(sha)) continue;
+    seen.add(sha);
+    const obj = repo.objects.get(sha);
+    if (obj === undefined || obj.type !== 'commit') continue;
+    const parsed = parseCommit(obj.data);
+    if (depth === deepen - 1) {
+      if (parsed.parents.length > 0) boundary.push(sha);
+      continue;
+    }
+    for (const parent of parsed.parents) queue.push({ sha: parent, depth: depth + 1 });
+  }
+  return boundary;
 }
 
 // ---------------------------------------------------------------- advertisements
@@ -395,6 +424,8 @@ export function sidebandPack(pack: Buffer): Buffer {
 export interface UploadRequest {
   wants: string[];
   haves: string[];
+  /** The shallow boundaries the client already records (deepen requests). */
+  shallow: string[];
   deepen?: number;
   refPrefixes: string[];
   command?: string;
@@ -406,11 +437,12 @@ export interface UploadRequest {
 export function parseUploadV0(body: Buffer): UploadRequest {
   const { lines, afterFlush } = parsePktLines(body);
   void afterFlush;
-  const req: UploadRequest = { wants: [], haves: [], refPrefixes: [] };
+  const req: UploadRequest = { wants: [], haves: [], shallow: [], refPrefixes: [] };
   for (const raw of lines) {
     const line = raw.split('\0')[0] as string;
     if (line.startsWith('want ')) req.wants.push(line.slice(5).trim().split(' ')[0] as string);
     else if (line.startsWith('have ')) req.haves.push(line.slice(5).trim());
+    else if (line.startsWith('shallow ')) req.shallow.push(line.slice(8).trim());
     else if (line.startsWith('deepen ')) req.deepen = Number.parseInt(line.slice(7).trim(), 10);
   }
   return req;
@@ -419,12 +451,13 @@ export function parseUploadV0(body: Buffer): UploadRequest {
 /** Parse a v2 upload-pack request body. */
 export function parseUploadV2(body: Buffer): UploadRequest {
   const { lines } = parsePktLines(body);
-  const req: UploadRequest = { wants: [], haves: [], refPrefixes: [] };
+  const req: UploadRequest = { wants: [], haves: [], shallow: [], refPrefixes: [] };
   for (const raw of lines) {
     const line = raw.trim();
     if (line.startsWith('command=')) req.command = line.slice('command='.length);
     else if (line.startsWith('want ')) req.wants.push(line.slice(5).trim());
     else if (line.startsWith('have ')) req.haves.push(line.slice(5).trim());
+    else if (line.startsWith('shallow ')) req.shallow.push(line.slice(8).trim());
     else if (line.startsWith('deepen ')) req.deepen = Number.parseInt(line.slice(7).trim(), 10);
     else if (line.startsWith('ref-prefix ')) req.refPrefixes.push(line.slice('ref-prefix '.length).trim());
     else if (line === 'peel') req.peel = true;
@@ -453,23 +486,31 @@ export function answerLsRefs(repo: Repo, req: UploadRequest): Buffer {
   }
   for (const [name, oid] of [...repo.tags.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
     const refName = `refs/tags/${name}`;
-    if (matches(refName)) lines.push(`${oid} ${refName}\n`);
-    if (req.peel === true && matches(refName)) {
+    if (!matches(refName)) continue;
+    if (req.peel === true) {
       const peeled = tagTarget(repo, oid);
-      if (peeled !== null) lines.push(`${peeled} ${refName}^{}\n`);
+      if (peeled !== null) {
+        lines.push(`${oid} ${refName} peeled:${peeled}\n`);
+        continue;
+      }
     }
+    lines.push(`${oid} ${refName}\n`);
   }
   return pktLines(...lines);
 }
 
-/** Answer a v2 fetch request: the sections the v2 fetch response is made of — a shallow-info section (when deepening) closed by a flush, then the packfile section carrying the pack as side-band-64k (channel 1). */
+/** Answer a v2 fetch request: the sections the v2 fetch response is made of — a shallow-info section (when deepening) with the new boundary and the old boundaries it unshallows, closed by a flush, then the packfile section carrying the pack as side-band-64k (channel 1). */
 export function answerFetchV2(repo: Repo, req: UploadRequest): Buffer {
   const objects = collectObjects(repo, req.wants, new Set(req.haves), req.deepen);
   const pack = buildPack([...objects.values()].sort((a, b) => (objectShaOf(a) < objectShaOf(b) ? -1 : 1)));
   const chunks: Buffer[] = [];
   if (req.deepen !== undefined) {
+    const boundary = shallowBoundary(repo, req.wants, req.deepen);
     chunks.push(pktLine('shallow-info\n'));
-    for (const want of req.wants) chunks.push(pktLine(`shallow ${want}\n`));
+    for (const sha of boundary) chunks.push(pktLine(`shallow ${sha}\n`));
+    for (const sha of req.shallow) {
+      if (!boundary.includes(sha)) chunks.push(pktLine(`unshallow ${sha}\n`));
+    }
     chunks.push(PKT_FLUSH);
   }
   chunks.push(pktLine('packfile\n'));
@@ -488,7 +529,7 @@ export function answerUploadV0(repo: Repo, req: UploadRequest): Buffer {
   }
   chunks.push(pktLine('NAK\n'));
   if (req.deepen !== undefined) {
-    for (const want of req.wants) chunks.push(pktLine(`shallow ${want}\n`));
+    for (const sha of shallowBoundary(repo, req.wants, req.deepen)) chunks.push(pktLine(`shallow ${sha}\n`));
   }
   chunks.push(sidebandPack(pack));
   return Buffer.concat(chunks);
