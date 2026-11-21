@@ -217,13 +217,16 @@ function commitObject(store: Store, repo: Repo, sha: string, message: string): R
   const obj = repo.objects.get(sha);
   const parsed = obj === undefined ? null : parseCommit(obj.data);
   const now = nowIso();
+  // The stored commit bytes end the message with a newline; the API reports
+  // the message without trailing newlines, as GitHub does.
+  const cleanMessage = message.replace(/\n+$/, '');
   return {
     sha,
     node_id: globalId('C', `${repo.owner}/${repo.name}:${sha}`),
     commit: {
       author: { name: store.viewerLogin, email: `${store.viewerLogin}@example.invalid`, date: now },
       committer: { name: store.viewerLogin, email: `${store.viewerLogin}@example.invalid`, date: now },
-      message,
+      message: cleanMessage,
       tree: { sha: parsed?.tree ?? '', url: '' },
       comment_count: 0,
       verification: { verified: false, reason: 'unsigned', signature: null, payload: null },
@@ -430,7 +433,7 @@ export function handleRest(ctx: RestContext): boolean {
       }
       const repo = store.createRepo(name, stringField(body, 'description'), body.private === true);
       if (repo === null) {
-        unprocessable(ctx, 'Repository creation failed.');
+        unprocessable(ctx, 'A repository with this name already exists.');
         return true;
       }
       sendJson(res, 201, repoObject(store, repo));

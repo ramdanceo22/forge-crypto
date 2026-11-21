@@ -264,12 +264,16 @@ function createHashSha1(data: Buffer): Buffer {
  * Collect the objects an upload-pack must send: everything reachable from
  * `wants`, minus everything reachable from `haves`, limited to `deepen`
  * generations when set (1 = the wanted commits and their trees/blobs only).
+ * A `have` that is one of the client's shallow boundaries does not hide its
+ * parents: the client holds the boundary commit and its tree, but nothing
+ * beyond it, so the walk must not mark the parents as held.
  */
 export function collectObjects(
   repo: Repo,
   wants: readonly string[],
   haves: ReadonlySet<string>,
   deepen?: number,
+  shallowBoundaries: ReadonlySet<string> = new Set(),
 ): Map<string, GitObject> {
   const out = new Map<string, GitObject>();
   const haveReachable = new Set<string>();
@@ -283,7 +287,8 @@ export function collectObjects(
       if (obj === undefined) continue;
       if (obj.type === 'commit') {
         const parsed = parseCommit(obj.data);
-        queue.push(parsed.tree, ...parsed.parents);
+        queue.push(parsed.tree);
+        if (!shallowBoundaries.has(sha)) queue.push(...parsed.parents);
       } else if (obj.type === 'tree') {
         for (const entry of parseTree(obj.data)) queue.push(entry.sha);
       }
@@ -501,7 +506,7 @@ export function answerLsRefs(repo: Repo, req: UploadRequest): Buffer {
 
 /** Answer a v2 fetch request: the sections the v2 fetch response is made of — a shallow-info section (when deepening) with the new boundary and the old boundaries it unshallows, closed by a flush, then the packfile section carrying the pack as side-band-64k (channel 1). */
 export function answerFetchV2(repo: Repo, req: UploadRequest): Buffer {
-  const objects = collectObjects(repo, req.wants, new Set(req.haves), req.deepen);
+  const objects = collectObjects(repo, req.wants, new Set(req.haves), req.deepen, new Set(req.shallow));
   const pack = buildPack([...objects.values()].sort((a, b) => (objectShaOf(a) < objectShaOf(b) ? -1 : 1)));
   const chunks: Buffer[] = [];
   if (req.deepen !== undefined) {
@@ -520,7 +525,7 @@ export function answerFetchV2(repo: Repo, req: UploadRequest): Buffer {
 
 /** Answer a v0 upload-pack request: ACK lines for the haves we share, then NAK, shallow lines, then the sideband pack. */
 export function answerUploadV0(repo: Repo, req: UploadRequest): Buffer {
-  const objects = collectObjects(repo, req.wants, new Set(req.haves), req.deepen);
+  const objects = collectObjects(repo, req.wants, new Set(req.haves), req.deepen, new Set(req.shallow));
   const pack = buildPack([...objects.values()].sort((a, b) => (objectShaOf(a) < objectShaOf(b) ? -1 : 1)));
   const chunks: Buffer[] = [];
   for (const have of req.haves) {
