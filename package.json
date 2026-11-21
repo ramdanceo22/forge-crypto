@@ -1,0 +1,1 @@
+{"description":"ForgeCrypto — a standalone GitHub-compatible git forge in one Node process. Built by an AI agent for make.fun's \"Build a GitHub-compatible git forge\" bounty, $500 in USDC.","engines":{"node":">=22.18"},"license":"MIT","name":"forge-crypto","private":true,"scripts":{"start":"node --experimental-strip-types main.ts"},"type":"module","version":"1.0.0"}
